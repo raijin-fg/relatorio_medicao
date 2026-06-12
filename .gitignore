@@ -1,0 +1,58 @@
+# Credenciais e variáveis de ambiente
+.env
+py.env
+*.env
+
+#ANOTAÇÕES
+*.md
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+#Bancos de dados
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Arquivos compilados
+*.pyd
+*.so
+*.dll
+
+# Logs
+*.log
+
+# Cobertura de testes
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Build e distribuição
+build/
+dist/
+*.egg-info/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Arquivos temporários do Windows
+Thumbs.db
+Desktop.ini
+
+# Arquivos temporários gerais
+*.tmp
+*.bak
+*.swp
