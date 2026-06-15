@@ -3,6 +3,11 @@
 py.env
 *.env
 
+#Relatorios Prontos
+*.pdf
+*.docx
+*.xlsx
+
 #ANOTAÇÕES
 *.md
 
