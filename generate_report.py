@@ -32,21 +32,21 @@ MAX_NETAPP_HOURS = 10.0   # duração alvo máxima por política NetApp (horas)
 
 # Cores
 C_HEADER_BG   = "1F3864"   # azul escuro
-C_HEADER_FT   = "FFFFFF"
+C_HEADER_FT   = "FFFFFF"   # branco
 C_SECTION_BG  = "D6E4F0"   # azul claro
-C_SECTION_FT  = "1F3864"
-C_ALT_ROW     = "F2F7FC"
-C_GREEN_BG    = "C6EFCE"
-C_GREEN_FT    = "276221"
-C_YELLOW_BG   = "FFEB9C"
-C_YELLOW_FT   = "9C6500"
-C_RED_BG      = "FFC7CE"
-C_RED_FT      = "9C0006"
-C_ORANGE_BG   = "FFD966"
-C_ORANGE_FT   = "7D4E00"
-C_GRAY_BG     = "D9D9D9"
-C_WHITE       = "FFFFFF"
-C_ACCENT      = "2E75B6"
+C_SECTION_FT  = "1F3864"   # azul escuro
+C_ALT_ROW     = "F2F7FC"   # azul muito claro
+C_GREEN_BG    = "C6EFCE"   # verde claro
+C_GREEN_FT    = "276221"   # verde escuro
+C_YELLOW_BG   = "FFEB9C"   # amarelo claro
+C_YELLOW_FT   = "9C6500"   # amarelo escuro
+C_RED_BG      = "FFC7CE"   # vermelho claro
+C_RED_FT      = "9C0006"   # vermelho escuro
+C_ORANGE_BG   = "FFD966"   # laranja claro
+C_ORANGE_FT   = "7D4E00"   # Laranja
+C_GRAY_BG     = "D9D9D9"   # Cinza
+C_WHITE       = "FFFFFF"   # branco
+C_ACCENT      = "2E75B6"   # 
 
 FONT_NAME = "Arial"
 
@@ -156,8 +156,9 @@ def _load(db_path):
             SELECT * FROM netapp_volumes
             ORDER BY snapshot_date, volume_name
         """).fetchall()
+        tapes_history = conn.execute("SELECT * FROM netbackup_tapes_history ORDER BY snapshot_month").fetchall()
 
-        return avail, jobs, pols, tapes, volumes
+        return avail, jobs, pols, tapes, volumes, tapes_history
     finally:
         conn.close()
 
@@ -489,120 +490,195 @@ def _sheet_backup_geral(wb, jobs):
 # ---------------------------------------------------------------------------
 
 def _sheet_janelas(wb, jobs):
+    """
+    Aba 4 — Otimização de Janelas de Backup (Fim de Semana de 63h com 6 Drivers)
+    Analisa a concorrência real e sugere o melhor horário de início dentro da janela.
+    """
     ws = wb.create_sheet("Otimização — Janelas")
     ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
 
-    # ---- Tabela principal de análise ----
-    _section_title(ws, 1, "ANÁLISE DE JANELAS DE BACKUP — UTILIZAÇÃO DE DRIVERS", 9)
+    # Título principal da aba
+    ws.merge_cells("A1:I1")
+    title_cell = ws["A1"]
+    title_cell.value = "ANÁLISE DE CONCORRÊNCIA E REESCALONAMENTO DE JANELAS (FULL WEEKEND)"
+    title_cell.font = _font(bold=True, size=11, color=C_HEADER_FT)
+    title_cell.fill = _fill(C_HEADER_BG)
+    title_cell.alignment = _align("left", "center")
+    ws.row_dimensions[1].height = 26
 
-    headers = ["Política", "Início", "Término", "Duração (h)",
-               "Volume (TB)", "Concorrentes no pico", "Conflito de drivers?",
-               "Sugestão de início", "Observação"]
-    widths  = [28, 20, 20, 14, 12, 22, 20, 20, 38]
-    _header_row(ws, 2, headers, widths)
+    # Cabeçalhos exatos solicitados
+    headers = [
+        "Job ID", "Politica", "Início", "Término", "Duração (h)", 
+        "Volume (TB)", "Concorrentes no Pico", "Conflito de Drivers?", "Sugestão de Início"
+    ]
+    _header_row(ws, 2, headers, widths=[12, 28, 18, 18, 14, 14, 22, 20, 45])
+    ws.row_dimensions[2].height = 22
 
-    # Monta lista de jobs com datetimes
-    job_list = []
+    # 1. MAPEAMENTO DE CONCORRÊNCIA POR HORA (Mapeia o mês em timestamps de hora em hora)
+    hourly_concurrency = {}
+    fds_jobs = []
+    
     for j in jobs:
-        start = _parse_dt(j["start_time"])
-        end   = _parse_dt(j["end_time"])
-        if not start or not end:
+        try:
+            job_dict = dict(j)
+        except:
+            job_dict = j
+
+        # Coleta estritamente das colunas reais existentes no banco
+        job_id = job_dict.get("job_id")
+        job_policy = job_dict.get("job_policy")
+        start_time = job_dict.get("start_time")
+        end_time = job_dict.get("end_time")
+        elapsed_time = job_dict.get("elapsed_time")
+        kilobytes = job_dict.get("kilobytes")
+
+        if not start_time or not end_time:
             continue
-        job_list.append({
-            "policy":   j["job_policy"],
-            "schedule": j["job_schedule"],
-            "start":    start,
-            "end":      end,
-            "hours":    _iso_to_hours(j["elapsed_time"]),
-            "tb":       _kb_to_tb(j["kilobytes"]),
-            "elapsed":  j["elapsed_time"],
+            
+        dt_start = _parse_dt(start_time)
+        dt_end = _parse_dt(end_time)
+        
+        dur_hours = _iso_to_hours(elapsed_time)
+        dur_sec = dur_hours * 3600
+        tb = _kb_to_tb(kilobytes) if kilobytes else 0.0
+        
+        # Filtro básico: foca em jobs que realmente têm impacto na janela (mais de 10 min ou volumosos)
+        if dur_sec < 600 and tb < 0.05: 
+            continue
+            
+        fds_jobs.append({
+            "id": job_id,
+            "policy": job_policy,
+            "start": dt_start,
+            "end": dt_end,
+            "hours": dur_hours,
+            "tb": tb
         })
+        
+        # Popula a linha do tempo de concorrência hora a hora
+        start_ts = int(dt_start.timestamp() // 3600) * 3600
+        end_ts = int(dt_end.timestamp() // 3600) * 3600
+        for ts in range(start_ts, end_ts + 3600, 3600):
+            hourly_concurrency[ts] = hourly_concurrency.get(ts, 0) + 1
 
-    # Para cada job, conta quantos outros rodam simultaneamente
-    def _concurrent_count(job, all_jobs):
-        return sum(
-            1 for j in all_jobs
-            if j is not job and j["start"] < job["end"] and j["end"] > job["start"]
+    # 2. CALCULAR PICO, CONFLITO E BUSCAR JANELA IDEAL (Sexta 18h às Segunda 09h)
+    row_idx = 3
+    for job in fds_jobs:
+        dt_start = job["start"]
+        dt_end = job["end"]
+        
+        # Determina o Pico de concorrentes que estavam ativos ao mesmo tempo que este job
+        job_start_ts = int(dt_start.timestamp() // 3600) * 3600
+        job_end_ts = int(dt_end.timestamp() // 3600) * 3600
+        
+        concorrentes_no_pico = 0
+        for ts in range(job_start_ts, job_end_ts + 3600, 3600):
+            cnt = hourly_concurrency.get(ts, 0)
+            if cnt > concorrentes_no_pico:
+                concorrentes_no_pico = cnt
+                
+        # Se o pico de jobs rodando juntos passou do limite de 6 drivers da CPTM
+        conflito = "Sim" if concorrentes_no_pico > NUM_DRIVERS else "Não"
+        
+        # --- ALGORITMO DE SUGESTÃO DE INÍCIO OTIMIZADO ---
+        # Vamos simular o início deste backup em cada hora do Fim de Semana (FDS) daquela mesma semana
+        # Janela Alvo: Começa Sexta às 18:00 e precisa terminar até Segunda às 09:00
+        
+        # Encontra a Sexta-feira daquela semana correspondente ao job
+        # weekday: 0=Seg, 1=Ter, 2=Qua, 3=Qui, 4=Sex, 5=Sáb, 6=Dom
+        dias_para_sexta = 4 - dt_start.weekday()
+        sexta_referencia = dt_start + pd.Timedelta(days=dias_para_sexta) # type: ignore
+        
+        base_sexta_18h = datetime(
+            sexta_referencia.year, sexta_referencia.month, sexta_referencia.day, 
+            18, 0, 0, tzinfo=timezone.utc
         )
+        limite_segunda_09h = base_sexta_18h + pd.Timedelta(hours=63) # type: ignore (63 horas depois = Segunda 09h)
+        
+        melhor_inicio = None
+        menor_carga_concorrencia = float("inf")
+        
+        # Duração do job em horas inteiras arredondada para cima para segurança de simulação
+        job_hours_needed = max(1, int(job["hours"] + 0.5))
+        
+        # Testamos cada janela inicial de hora em hora da Sexta 18h até Segunda 09h
+        for offset_horas in range(63):
+            sim_start = base_sexta_18h + pd.Timedelta(hours=offset_horas) # type: ignore
+            sim_end = sim_start + pd.Timedelta(hours=job_hours_needed) # type: ignore
+            
+            # Validação Crítica: O job simulado consegue terminar antes de Segunda às 09:00?
+            if sim_end > limite_segunda_09h:
+                break # Daqui para a frente nenhum outro horário respeitará o limite de segunda
+                
+            # Calcula a soma de concorrência que esse bloco enfrentaria
+            carga_concorrencia_janela = 0
+            sim_start_ts = int(sim_start.timestamp() // 3600) * 3600
+            for h_ts in range(sim_start_ts, sim_start_ts + (job_hours_needed * 3600), 3600):
+                carga_concorrencia_janela += hourly_concurrency.get(h_ts, 0)
+                
+            # Queremos o horário que tenha a menor média de concorrência acumulada nos drivers
+            if carga_concorrencia_janela < menor_carga_concorrencia:
+                menor_carga_concorrencia = carga_concorrencia_janela
+                melhor_inicio = sim_start
+                
+        # Define a mensagem final da sugestão
+        if conflito == "Não":
+            sugestao = "✔ Manter horário atual (Sem saturação de drivers)."
+            cell_fill = None
+            cell_font_color = "000000"
+        elif melhor_inicio:
+            # Tradução amigável do dia da semana sugerido
+            dias_traducao = {4: "Sex", 5: "Sáb", 6: "Dom", 0: "Seg"}
+            dia_str = dias_traducao.get(melhor_inicio.weekday(), "FDS")
+            sugestao = f"Mover para {dia_str} às {melhor_inicio.strftime('%H:%M')} (Janela mais ociosa)."
+            cell_fill = C_YELLOW_BG
+            cell_font_color = C_YELLOW_FT
+        else:
+            sugestao = "⚠ Janela de FDS cheia. Recomendado Split de política."
+            cell_fill = C_RED_BG
+            cell_font_color = C_RED_FT
 
-    # Agrupa por política (pega o de maior duração se houver múltiplos)
-    policy_jobs = {}
-    for j in job_list:
-        p = j["policy"]
-        if p not in policy_jobs or j["hours"] > policy_jobs[p]["hours"]:
-            policy_jobs[p] = j
+        # Escrita dos dados na planilha seguindo a formatação padrão do projeto
+        ws.cell(row=row_idx, column=1, value=job["id"])
+        ws.cell(row=row_idx, column=2, value=job["policy"])
+        ws.cell(row=row_idx, column=3, value=dt_start.astimezone().strftime("%d/%m/%Y %H:%M"))
+        ws.cell(row=row_idx, column=4, value=dt_end.astimezone().strftime("%d/%m/%Y %H:%M"))
+        ws.cell(row=row_idx, column=5, value=round(job["hours"], 2))
+        ws.cell(row=row_idx, column=6, value=job["tb"])
+        ws.cell(row=row_idx, column=7, value=f"{concorrentes_no_pico} Jobs ativos")
+        ws.cell(row=row_idx, column=8, value=conflito)
+        
+        cell_sugestao = ws.cell(row=row_idx, column=9, value=sugestao)
+        if cell_fill:
+            cell_sugestao.fill = _fill(cell_fill)
+            cell_sugestao.font = _font(bold=True, color=cell_font_color)
 
-    representative = list(policy_jobs.values())
-    representative.sort(key=lambda j: j["start"])
+        # Estilização das linhas (Zebra e Bordas) mantendo a harmonia visual corporativa
+        bg_row = C_ALT_ROW if row_idx % 2 == 0 else C_WHITE
+        for col in range(1, 10):
+            c = ws.cell(row=row_idx, column=col)
+            if col != 9:  # Preserva o destaque de cor na coluna de sugestão
+                c.fill = _fill(bg_row)
+                c.font = _font()
+            c.border = _border()
+            if col in [1, 3, 4, 5, 6, 7, 8]:
+                c.alignment = _align("center")
+            else:
+                c.alignment = _align("left")
 
-    # Heatmap de uso de drivers por hora (baseado em UTC local)
-    hour_counts = [0] * 24
-    for j in job_list:
-        s = j["start"].replace(tzinfo=None)
-        e = j["end"].replace(tzinfo=None)
-        cur = s
-        while cur < e:
-            hour_counts[cur.hour] += 1
-            cur = cur.replace(minute=0, second=0) + pd.Timedelta(hours=1)  # type: ignore
+        # Formatações de número do Excel
+        ws.cell(row=row_idx, column=5).number_format = "#,##0.00' h'"
+        ws.cell(row=row_idx, column=6).number_format = "#,##0.0000' TB'"
+        ws.row_dimensions[row_idx].height = 20
+        row_idx += 1
 
-    peak_hour = max(range(24), key=lambda h: hour_counts[h])
-
-    row = 3
-    for i, j in enumerate(representative):
-        conc = _concurrent_count(j, job_list)
-        conflict = conc >= NUM_DRIVERS
-        conflict_str = f"⚠ Sim ({conc} jobs)" if conflict else f"Não ({conc} jobs)"
-
-        # Sugestão simples: hora de menor ocupação próxima ao início atual
-        cur_hour = j["start"].hour
-        sorted_hours = sorted(range(24), key=lambda h: hour_counts[h])
-        suggested_h = next((h for h in sorted_hours if h != peak_hour), cur_hour)
-        suggestion = f"{suggested_h:02d}:00" if conflict else "—"
-        obs = (f"Considere mover para {suggestion} — menor concorrência" if conflict
-               else "Janela adequada")
-
-        alt = i % 2 == 1
-        bg_conflict = C_RED_BG if conflict else (C_ALT_ROW if alt else C_WHITE)
-
-        vals = [
-            j["policy"],
-            j["start"].astimezone().strftime("%d/%m/%Y %H:%M"),
-            j["end"].astimezone().strftime("%d/%m/%Y %H:%M"),
-            round(j["hours"], 2),
-            round(j["tb"], 3),
-            conc,
-            conflict_str,
-            suggestion,
-            obs,
-        ]
-        for col, val in enumerate(vals, 1):
-            cell = ws.cell(row=row, column=col, value=val)
-            cell.font = _font(bold=(col == 7 and conflict), color=(C_RED_FT if (col == 7 and conflict) else "000000"))
-            cell.fill = _fill(bg_conflict if col in (6, 7) else (C_ALT_ROW if alt else C_WHITE))
-            cell.alignment = _align("center" if col in (2, 3, 4, 5, 6, 7, 8) else "left")
-            cell.border = _border()
-        row += 1
-
-    # ---- Heatmap de ocupação por hora ----
-    row += 1
-    _section_title(ws, row, "HEATMAP — JOBS ATIVOS POR FAIXA HORÁRIA (horário local)", 9)
-    row += 1
-    _header_row(ws, row, [f"{h:02d}h" for h in range(24)] + ["Limite drivers"])
-    row += 1
-    for col, cnt in enumerate(hour_counts, 1):
-        cell = ws.cell(row=row, column=col, value=cnt)
-        cell.font = _font(bold=(cnt > NUM_DRIVERS), color=C_RED_FT if cnt > NUM_DRIVERS else "000000")
-        cell.fill = _fill(C_RED_BG if cnt > NUM_DRIVERS else (C_YELLOW_BG if cnt == NUM_DRIVERS else C_GREEN_BG))
-        cell.alignment = _align("center")
-        cell.border = _border()
-        ws.column_dimensions[get_column_letter(col)].width = 6
-    # Coluna "Limite drivers"
-    cell = ws.cell(row=row, column=25, value=NUM_DRIVERS)
-    cell.font = _font(bold=True)
-    cell.fill = _fill(C_SECTION_BG)
-    cell.alignment = _align("center")
-    cell.border = _border()
-    ws.column_dimensions[get_column_letter(25)].width = 16
+    # Ajuste automático de largura por coluna (exceto a I que é larga por causa do texto longo)
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        if col_letter != 'I':
+            max_len = max(len(str(cell.value or '')) for cell in col)
+            ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
 # ---------------------------------------------------------------------------
 # Aba 5 — Otimização NetApp (split de políticas)
@@ -904,12 +980,703 @@ def _sheet_fitas(wb, tapes):
         row += 1
 
 # ---------------------------------------------------------------------------
+# Aba 8 — Capacidade
+# ---------------------------------------------------------------------------  
+
+def _sheet_capacidade_fitas(wb, tapes, tapes_history, db_path):
+    latest_tape_date = None
+    """
+    Aba Nova — Capacidade de Fitas (Evolução Histórica e Gráfico de Linha)
+    Calcula o mês corrente baseado em netbackup_tapes, atualiza o histórico e plota o gráfico.
+    """
+    from openpyxl.chart import LineChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    
+    ws = wb.create_sheet("Capacidade — Fitas")
+    ws.sheet_view.showGridLines = False
+
+# --- 1. PROCESSA E ATUALIZA MÊS ATUAL ---
+    # Correção: Acessando diretamente por colchetes, já que sqlite3.Row não aceita .get()
+    total_kb_atual = sum((t["kilobytes"] if t["kilobytes"] is not None else 0) for t in tapes if t["snapshot_date"] == latest_tape_date)
+    total_tb_atual = total_kb_atual / (1024 ** 3) # KB para TB
+
+    # Identifica o mês do snapshot atual das fitas (Formato: YYYY-MM)
+    latest_tape_date = max((t["snapshot_date"] for t in tapes if t["snapshot_date"]), default=None)
+    if latest_tape_date:
+        try:
+            # Tenta tratar formatos comuns como YYYY-MM-DD
+            dt_base = datetime.strptime(latest_tape_date[:10], "%Y-%m-%d")        
+        except:
+            dt_base = datetime.now()
+    else:
+        dt_base = datetime.now()
+    
+    dt_mes_anterior = dt_base - pd.Timedelta(days=dt_base.day + 2)
+    mes_atual_str = dt_mes_anterior.strftime("%Y-%m")
+
+    # Atualiza em banco de dados para o histórico persistir nas próximas execuções
+    if db_path and total_tb_atual > 0:
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO netbackup_tapes_history (snapshot_month, used_tb) VALUES (?, ?)",
+                (mes_atual_str, round(total_tb_atual, 2))
+            )
+            conn.commit()
+            # Atualiza a lista local para plotagem imediata no relatório atual
+            tapes_history = conn.execute("SELECT * FROM netbackup_tapes_history ORDER BY snapshot_month").fetchall()
+        except Exception as e:
+            print(f"Aviso ao salvar histórico de fitas: {e}")
+        finally:
+            conn.close()
+
+    # Filtra e captura os últimos 12 registros de meses para não estourar o tamanho horizontal da tela
+    historico_12_meses = sorted(
+        [{"snapshot_month": row[0], "used_tb": row[1]} for row in tapes_history],
+        key=lambda x: x["snapshot_month"]
+    )[-12:]
+
+    # --- 2. CONSTRUÇÃO DA TABELA DE CAPACIDADE HISTÓRICA ---
+    # Título da Seção
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(historico_12_meses) + 1)
+    title_cell = ws.cell(row=1, column=1, value="Capacidade Total de Backup - CPTM em TB")
+    title_cell.font = _font(bold=True, size=14, color=C_HEADER_FT)
+    title_cell.fill = _fill(C_ACCENT) # Usa o azul vibrante de destaque para bater com a imagem 2
+    title_cell.alignment = _align("center", "center")
+    ws.row_dimensions[1].height = 28
+
+    # Monta os rótulos horizontais dos meses (convertendo '2025-05' para 'mai/25')
+    meses_traducao = {
+        "01": "jan", "02": "fev", "03": "mar", "04": "abr", "05": "mai", "06": "jun",
+        "07": "jul", "08": "ago", "09": "set", "10": "out", "11": "nov", "12": "dez"
+    }
+    
+    headers_meses = ["Métrica / Período"]
+    for row in historico_12_meses:
+        ano, mes = row["snapshot_month"].split("-")
+        headers_meses.append(f"{meses_traducao.get(mes, mes)}/{ano[2:]}")
+
+    # Escreve Cabeçalho de Meses
+    for col_idx, text in enumerate(headers_meses, 1):
+        cell = ws.cell(row=2, column=col_idx, value=text)
+        cell.font = _font(bold=True, color="000000")
+        cell.fill = _fill(C_GRAY_BG if col_idx == 1 else C_WHITE)
+        cell.alignment = _align("center", "center")
+        cell.border = _border()
+    ws.row_dimensions[2].height = 22
+
+    # ALTERAR QUANDO MAIS FITAS FOREM ADICIONADAS - ATUALMENTE CONSIDERANDO FITAS X 12 TB CADA
+    total_capacity = 7200.0 # 600 fitas * 12 TB fixos informados
+    
+    row_capacidade = ["Capacidade Total"] + [total_capacity] * len(historico_12_meses)
+    row_em_uso = ["Espaço Backup - Em Uso"] + [r["used_tb"] for r in historico_12_meses]
+    row_disponivel = ["Espaço Backup - Disponível"] + [round(total_capacity - r["used_tb"], 2) for r in historico_12_meses]
+
+    for idx_r, dados_linha in enumerate([row_capacidade, row_em_uso, row_disponivel], 3):
+        for col_idx, val in enumerate(dados_linha, 1):
+            cell = ws.cell(row=idx_r, column=col_idx, value=val)
+            cell.border = _border()
+            
+            if col_idx == 1:
+                cell.font = _font(bold=False)
+                cell.fill = _fill(C_WHITE)
+                cell.alignment = _align("left")
+            else:
+                cell.font = _font()
+                cell.fill = _fill(C_WHITE)
+                cell.alignment = _align("center")
+                cell.number_format = '#,##0.00'
+        ws.row_dimensions[idx_r].height = 20
+
+    # Destaca a primeira coluna de cabeçalhos estáticos de métrica
+    ws.column_dimensions["A"].width = 28
+    for col_idx in range(2, len(headers_meses) + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 13
+
+    # --- 3. ALGORITMO DE PREVISÃO DE ESGOTAMENTO (MÉDIA MÓVEL LINEAR) ---
+    row_analise = 7
+    _section_title(ws, row_analise, "ANÁLISE PREDITIVA DE ESGOTAMENTO DE CAPACIDADE", 5, bg=C_HEADER_BG, ft=C_HEADER_FT)
+    
+    # Calcula crescimento médio mensal real
+    crescimentos = []
+    for idx in range(1, len(historico_12_meses)):
+        diff = historico_12_meses[idx]["used_tb"] - historico_12_meses[idx-1]["used_tb"]
+        crescimentos.append(diff)
+        
+    avg_crescimento_mensal = sum(crescimentos) / len(crescimentos) if crescimentos else 0.0
+    ultimo_uso_tb = historico_12_meses[-1]["used_tb"]
+    espaco_disponivel_tb = total_capacity - ultimo_uso_tb
+    
+    if avg_crescimento_mensal > 0:
+        meses_restantes = espaco_disponivel_tb / avg_crescimento_mensal
+        data_esgotamento = datetime.now() + pd.Timedelta(days=int(meses_restantes * 30.4)) # type: ignore
+        status_previsao = f"Esgotamento previsto em aproximadamente {int(meses_restantes)} meses ({data_esgotamento.strftime('%m/%Y')})."
+        previsao_color_bg = C_YELLOW_BG
+        previsao_color_ft = C_YELLOW_FT
+        if meses_restantes <= 6: # Crítico se faltar menos de 6 meses
+            previsao_color_bg = C_RED_BG
+            previsao_color_ft = C_RED_FT
+    else:
+        status_previsao = "✔ Estabilizado: Crescimento nulo ou negativo observado nos últimos meses."
+        previsao_color_bg = C_GREEN_BG
+        previsao_color_ft = C_GREEN_FT
+
+    _header_row(ws, row_analise + 1, ["Métrica Preditiva", "Valor Calculado"], widths=[32, 55])
+    
+    indicadores = [
+        ("Crescimento Médio Mensal Observado", f"{avg_crescimento_mensal:.2f} TB / mês"),
+        ("Espaço Livre em Estoque (Fitas)", f"{espaco_disponivel_tb:.2f} TB"),
+        ("Status de Atenção da Janela", status_previsao)
+    ]
+    
+    row_curr = row_analise + 2
+    for i, (lab, val) in enumerate(indicadores):
+        c1 = ws.cell(row=row_curr, column=1, value=lab)
+        c2 = ws.cell(row=row_curr, column=2, value=val)
+        c1.border = _border(); c2.border = _border()
+        c1.font = _font(); c1.fill = _fill(C_ALT_ROW if i % 2 == 0 else C_WHITE)
+        
+        if i == 2: # Destaca a linha de previsão
+            c2.font = _font(bold=True, color=previsao_color_ft)
+            c2.fill = _fill(previsao_color_bg)
+        else:
+            c2.font = _font(bold=True)
+            c2.fill = _fill(C_ALT_ROW if i % 2 == 0 else C_WHITE)
+        row_curr += 1
+
+
+    # --- 4. GERAÇÃO DO GRÁFICO DE LINHAS (PADRÃO CPTM EXECUTIVO) ---
+    chart = LineChart()
+    chart.title = "Volume Backup CPTM - Total X Em Uso (TB) - Mês"
+    chart.style = 13 # Estilo nativo limpo do Excel
+    chart.y_axis.title = "Capacidade (TB)"
+    chart.x_axis.title = "Meses de Referência"
+    chart.width = 24
+    chart.height = 13
+    
+    # Referência dos dados (Linhas 3 a 5 da planilha, cobrindo as colunas dos meses)
+    data_ref = Reference(ws, min_col=1, min_row=3, max_col=len(historico_12_meses) + 1, max_row=5)
+    # Referência das categorias do eixo X (Linha 2, colunas dos meses)
+    cats_ref = Reference(ws, min_col=2, min_row=2, max_col=len(historico_12_meses) + 1, max_row=2)
+    
+    chart.add_data(data_ref, titles_from_data=True, from_rows=True)
+    chart.set_categories(cats_ref)
+    
+    # Habilita rótulos de dados flutuantes sobre a linha (Data Labels) para simular o seu print
+    for serie in chart.series:
+        serie.dataLabels = DataLabelList()
+        serie.dataLabels.showVal = True
+        serie.graphicalProperties.line.width = 25000  # Engrossa um pouco a linha para melhor visibilidade
+        
+    # Customização manual das cores das linhas no gráfico para bater com a imagem informada
+    if len(chart.series) >= 3:
+        chart.series[0].graphicalProperties.solidFill = "2E75B6" # Linha Total -> Azul Destaque
+        chart.series[1].graphicalProperties.solidFill = "E67E22" # Linha Em Uso -> Laranja
+        chart.series[2].graphicalProperties.solidFill = "A6ACAF" # Linha Disponível -> Cinza
+
+    # Posiciona o gráfico logo abaixo dos quadros de análise preditiva
+    ws.add_chart(chart, "A13")      
+
+#----------------------------------------------------------------------------
+# Aba 9 — NetApp — 15 maiores volumes por uso
+#----------------------------------------------------------------------------
+
+def _sheet_netapp_15_maiores(wb, volumes):
+    """
+    Aba Nova — Análise dos 15 Maiores Volumes NetApp (Percentual, Tamanho Absoluto e Crescimento)
+    Gera as três matrizes analíticas solicitadas e plota o gráfico de barras empilhadas de cota.
+    """
+    from openpyxl.chart import BarChart, Reference
+    
+    ws = wb.create_sheet("15 Maiores — NetApp")
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    # --- 1. PROCESSAMENTO DE DATAS (ATUAL X ANTERIOR) ---
+    todas_datas = sorted(list(set(v["snapshot_date"] for v in volumes)))
+    if len(todas_datas) < 1:
+        return
+        
+    data_atual = todas_datas[-1]
+    data_anterior = todas_datas[-2] if len(todas_datas) >= 2 else None
+
+    # Agrupa dados em dicionários indexados pelo nome do volume para cálculos ágeis
+    vols_atuais = {v["volume_name"].upper(): dict(v) for v in volumes if v["snapshot_date"] == data_atual}
+    vols_anteriores = {v["volume_name"].upper(): dict(v) for v in volumes if v["snapshot_date"] == data_anterior} if data_anterior else {}
+
+    # --- 2. GERAÇÃO DAS REGRAS DE NEGÓCIO DE TOP 15 ---
+    lista_analitica = []
+    for name, v in vols_atuais.items():
+        total = v["total_gb"] or 0.0
+        used = v["used_gb"] or 0.0
+        free = v["free_gb"] or 0.0
+        pct = (used / total * 100) if total > 0 else 0.0
+        
+        # Calcula crescimento em relação ao snapshot imediatamente anterior
+        v_ant = vols_anteriores.get(name)
+        growth = (used - v_ant["used_gb"]) if v_ant and v_ant["used_gb"] is not None else 0.0
+        
+        lista_analitica.append({
+            "name": name, "total": total, "used": used, "free": free, "pct": pct, "growth": growth
+        })
+
+    # Extrações de Rankings (Top 15 de cada métrica)
+    top15_pct = sorted(lista_analitica, key=lambda x: x["pct"], reverse=True)[:15]
+    top15_used = sorted(lista_analitica, key=lambda x: x["used"], reverse=True)[:15]
+    top15_growth = sorted(lista_analitica, key=lambda x: x["growth"], reverse=True)[:15]
+
+    # --- 3. CONSTRUÇÃO VISUAL DA TABELA 1 (MAIORES POR PERCENTUAL) ---
+    # Título Principal da Seção Esquerda
+    ws.merge_cells("A1:E1")
+    t1 = ws["A1"]
+    t1.value = "Capacidade Cota - CPTM 15 Maiores Utilizados (Por Percentual)"
+    t1.font = _font(bold=True, size=11, color=C_HEADER_FT)
+    t1.fill = _fill("262626") # Fundo escuro conforme imagem 4
+    t1.alignment = _align("center")
+    ws.row_dimensions[1].height = 24
+
+    headers_t1 = ["Pasta", "Cota Total da Pasta (GB)", "Usado GB", "Cota em Uso (%)", "Disponível GB"]
+    _header_row(ws, 2, headers_t1, bg=C_GRAY_BG, ft="000000")
+    ws.row_dimensions[2].height = 20
+
+    for idx, item in enumerate(top15_pct):
+        r = 3 + idx
+        alt = idx % 2 == 1
+        # Injeta prefixo fictício '\\PARIS\' para bater exatamente com a estética operacional da imagem 4
+        vals = [f"\\\\PARIS\\{item['name']}", item["total"], item["used"], item["pct"]/100, item["free"]]
+        _data_row(ws, r, vals, alt=alt)
+        
+        # Formatações numéricas customizadas
+        ws.cell(row=r, column=2).number_format = '#,##0'
+        ws.cell(row=r, column=3).number_format = '#,##0.00'
+        ws.cell(row=r, column=4).number_format = '0.00%'
+        ws.cell(row=r, column=5).number_format = '#,##0.00'
+        ws.cell(row=r, column=1).alignment = _align("left")
+        for col in range(2, 6):
+            ws.cell(row=r, column=col).alignment = _align("right")
+        ws.row_dimensions[r].height = 19
+
+    # --- 4. CONSTRUÇÃO VISUAL DA TABELA 2 (MAIORES POR TAMANHO ABSOLUTO) ---
+    # Posicionada ao lado direito (Colunas G a K)
+    ws.merge_cells("G1:K1")
+    t2 = ws["G1"]
+    t2.value = "Volume Absoluto - CPTM 15 Maiores Espaços Ocupados (GB)"
+    t2.font = _font(bold=True, size=11, color=C_HEADER_FT)
+    t2.fill = _fill(C_HEADER_BG)
+    t2.alignment = _align("center")
+
+    # Escreve o cabeçalho da Tabela 2
+    for col_idx, text in enumerate(headers_t1, 7):
+        cell = ws.cell(row=2, column=col_idx, value=text)
+        cell.font = _font(bold=True, color="000000")
+        cell.fill = _fill(C_GRAY_BG)
+        cell.alignment = _align("center")
+        cell.border = _border()
+
+    for idx, item in enumerate(top15_used):
+        r = 3 + idx
+        alt = idx % 2 == 1
+        vals = [f"\\\\PARIS\\{item['name']}", item["total"], item["used"], item["pct"]/100, item["free"]]
+        
+        for c_offset, val in enumerate(vals, 7):
+            cell = ws.cell(row=r, column=c_offset, value=val)
+            cell.font = _font()
+            cell.fill = _fill(C_ALT_ROW if alt else C_WHITE)
+            cell.border = _border()
+            
+            if c_offset == 7:
+                cell.alignment = _align("left")
+            else:
+                cell.alignment = _align("right")
+                if c_offset == 10:
+                    cell.number_format = '0.00%'
+                elif c_offset == 8:
+                    cell.number_format = '#,##0'
+                else:
+                    cell.number_format = '#,##0.00'
+
+    # --- 5. CONSTRUÇÃO VISUAL DA TABELA 3 (MAIORES TAXAS DE CRESCIMENTO) ---
+    # Posicionada abaixo da tabela 2 (Coluna G, linha 21)
+    start_r_t3 = 21
+    ws.merge_cells(start_row=start_r_t3, start_column=7, end_row=start_r_t3, end_column=10)
+    t3 = ws.cell(row=start_r_t3, column=7)
+    t3.value = f"Impacto Mensal — 15 Maiores Crescimentos (Base: {data_anterior or 'Mês Ant.'} X {data_atual})"
+    t3.font = _font(bold=True, size=11, color=C_HEADER_FT)
+    t3.fill = _fill(C_ORANGE_BG)
+    ws.cell(row=start_r_t3, column=7).font = _font(bold=True, size=11, color=C_ORANGE_FT)
+    t3.alignment = _align("center")
+    ws.row_dimensions[start_r_t3].height = 24
+
+    headers_t3 = ["Pasta Target", "Ocupação Anterior (GB)", "Ocupação Atual (GB)", "Variação Mensal Delta (GB)"]
+    for col_idx, text in enumerate(headers_t3, 7):
+        cell = ws.cell(row=start_r_t3 + 1, column=col_idx, value=text)
+        cell.font = _font(bold=True, color=C_HEADER_FT)
+        cell.fill = _fill(C_HEADER_BG)
+        cell.alignment = _align("center")
+        cell.border = _border()
+    ws.row_dimensions[start_r_t3 + 1].height = 20
+
+    for idx, item in enumerate(top15_growth):
+        r = start_r_t3 + 2 + idx
+        alt = idx % 2 == 1
+        vol_ant_used = vols_anteriores.get(item["name"], {}).get("used_gb", 0.0)
+        
+        vals = [f"\\\\PARIS\\{item['name']}", vol_ant_used, item["used"], item["growth"]]
+        
+        for c_offset, val in enumerate(vals, 7):
+            cell = ws.cell(row=r, column=c_offset, value=val)
+            cell.font = _font()
+            cell.fill = _fill(C_ALT_ROW if alt else C_WHITE)
+            cell.border = _border()
+            
+            if c_offset == 7:
+                cell.alignment = _align("left")
+            else:
+                cell.alignment = _align("right")
+                cell.number_format = '#,##0.00'
+                
+            # Destaque condicional sutil: se cresceu mais de 50GB em um único mês, pinta a célula de variação de vermelho
+            if c_offset == 10 and item["growth"] > 50.0:
+                cell.fill = _fill(C_RED_BG)
+                cell.font = _font(bold=True, color=C_RED_FT)
+        ws.row_dimensions[r].height = 19
+
+    # Ajuste milimétrico das larguras das colunas para evitar o estouro de texto (###)
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 15
+    ws.column_dimensions["D"].width = 16
+    ws.column_dimensions["E"].width = 15
+    ws.column_dimensions["F"].width = 4   # Coluna de espaçamento em branco entre as tabelas
+    ws.column_dimensions["G"].width = 24
+    ws.column_dimensions["H"].width = 24
+    ws.column_dimensions["I"].width = 15
+    ws.column_dimensions["J"].width = 25
+    ws.column_dimensions["K"].width = 15
+
+    # --- 6. IMPLEMENTAÇÃO DO GRÁFICO DE BARRAS EMPILHADAS (100% COTA) ---
+    chart = BarChart()
+    chart.type = "bar"
+    chart.grouping = "percentStacked" # Força o empilhamento proporcional a 100% igual ao print 5
+    chart.overlap = 100
+    chart.title = "15 Maiores Usos (%)"
+    chart.width = 19
+    chart.height = 14
+    
+    # Captura dados das colunas Usado (Col C) e Disponível (Col E).
+    # O openpyxl precisa ler colunas contíguas ou tratadas. Para o gráfico empilhado ideal de 2 séries:
+    # Usaremos referências dinâmicas das colunas de dados criadas na Tabela 1.
+    data_ref = Reference(ws, min_col=3, min_row=2, max_col=5, max_row=17) # Pega coluna C até E (Linhas 2 a 17)
+    cats_ref = Reference(ws, min_col=1, min_row=3, max_row=17) # Nomes das Pastas na coluna A
+    
+    chart.add_data(data_ref, titles_from_data=True, from_rows=False)
+    chart.set_categories(cats_ref)
+    
+    # Remove a série central do percentual (Coluna D) para não duplicar dados no gráfico, 
+    # mantendo puramente as parcelas absolutas de Usado e Disponível que formam os 100% da cota.
+    if len(chart.series) == 3:
+        del chart.series[1] 
+
+    # Configuração de Cores das Séries para replicar perfeitamente a Imagem 5
+    chart.series[0].graphicalProperties.solidFill = "F4A460" # Usado GB -> Cor Laranja Suave / Areia
+    chart.series[1].graphicalProperties.solidFill = "B0BF1A" # Disponível GB -> Cinza / Verde Oliva Claro
+    
+    # Força a exibição da legenda na base inferior do gráfico
+    chart.legend.position = "b" # type: ignore
+
+    # Insere o gráfico logo abaixo da primeira tabela (Linha 21 da coluna A)
+    ws.add_chart(chart, "A21")
+
+#-------------------------------------------------------------------------------
+# Aba 10 — Gantt de Jobs
+#-------------------------------------------------------------------------------
+
+def _sheet_gantt_jobs(wb, jobs):
+    """
+    Aba Nova — Diagrama de Gantt Visual dos Jobs de Backup
+    Mapeia a linha do tempo dos jobs usando um gráfico de barras horizontais empilhadas.
+    """
+    from openpyxl.chart import BarChart, Reference
+    
+    ws = wb.create_sheet("Gantt — Janela Mensal")
+    ws.sheet_view.showGridLines = False
+    
+    # Título Principal da Aba
+    ws.merge_cells("A1:D1")
+    title_cell = ws["A1"]
+    title_cell.value = "DIAGRAMA DE GANTT — CRONOGRAMA DE EXECUÇÃO DOS JOBS"
+    title_cell.font = _font(bold=True, size=11, color=C_HEADER_FT)
+    title_cell.fill = _fill(C_HEADER_BG)
+    title_cell.alignment = _align("left", "center")
+    ws.row_dimensions[1].height = 26
+
+    # Cabeçalho da Tabela de Dados de Suporte do Gráfico
+    headers = ["Política / Job", "Data/Hora Início", "Ponto de Partida (Excel Num)", "Duração Real (Dias)"]
+    _header_row(ws, 2, headers, widths=[35, 18, 22, 18])
+    ws.row_dimensions[2].height = 20
+
+    # 1. FILTRAGEM E ORDENAÇÃO DOS JOBS
+    valid_jobs = []
+    for j in jobs:
+        try:
+            job_dict = dict(j)
+        except:
+            job_dict = j
+            
+        start_time = job_dict.get("start_time")
+        elapsed_time = job_dict.get("elapsed_time")
+        policy = job_dict.get("job_policy") or "Sem Política"
+        job_id = job_dict.get("job_id")
+        
+        if not start_time or not elapsed_time:
+            continue
+            
+        dt_start = _parse_dt(start_time)
+        dur_hours = _iso_to_hours(elapsed_time)
+        
+        # Filtro: Foca apenas nos jobs relevantes da janela mensal (descarta ruídos menores de 15 min)
+        if dur_hours < 0.25:
+            continue
+            
+        valid_jobs.append({
+            "label": f"{policy} (ID: {job_id})",
+            "dt_start": dt_start,
+            "dur_days": dur_hours / 24.0 # Transforma horas em fração de dia para o Excel calcular o Gantt
+        })
+        
+    # Ordena os jobs cronologicamente pelo horário de início (fundamental para o Gantt fazer sentido)
+    valid_jobs = sorted(valid_jobs, key=lambda x: x["dt_start"])
+    
+    # Limita aos 35 maiores/principais se a lista for gigantesca, para o gráfico não virar um bloco preto ilegível
+    valid_jobs = valid_jobs[:35]
+
+    if not valid_jobs:
+        ws.cell(row=3, column=1, value="Nenhum job pesado mapeado para esta janela mensal.")
+        return
+
+    # Descobre o ponto zero do gráfico (o primeiro backup a começar no mês)
+    primeiro_start_dt = valid_jobs[0]["dt_start"]
+
+    # 2. ESCRITA DOS DADOS NA PLANILHA
+    row_idx = 3
+    for job in valid_jobs:
+        ws.cell(row=row_idx, column=1, value=job["label"])
+        ws.cell(row=row_idx, column=2, value=job["dt_start"].astimezone().strftime("%d/%m %H:%M"))
+        
+        # Ponto de Partida: Diferença em dias desde o primeiro job para criar o deslocamento horizontal
+        delta_dias = (job["dt_start"] - primeiro_start_dt).total_seconds() / 86400.0
+        ws.cell(row=row_idx, column=3, value=delta_dias)
+        
+        # Duração real em fração de dias
+        ws.cell(row=row_idx, column=4, value=job["dur_days"])
+        
+        # Formatações Visuais de suporte
+        bg_row = C_ALT_ROW if row_idx % 2 == 0 else C_WHITE
+        for col in range(1, 5):
+            c = ws.cell(row=row_idx, column=col)
+            c.fill = _fill(bg_row)
+            c.font = _font()
+            c.border = _border()
+            c.alignment = _align("center" if col > 1 else "left")
+            if col in [3, 4]:
+                c.number_format = '0.0000'
+                
+        ws.row_dimensions[row_idx].height = 18
+        row_idx += 1
+
+    # --- 3. CONSTRUÇÃO E RENDEREZAÇÃO DO GRÁFICO DE GANTT ---
+    chart = BarChart()
+    chart.type = "bar"
+    chart.grouping = "stacked"  # Empilhado: Essencial para o efeito de Gantt
+    chart.overlap = 100
+    chart.title = f"Linha do Tempo e Duração dos Backups Mensais - Referência: {primeiro_start_dt.strftime('%m/%Y')}"
+    chart.width = 25
+    chart.height = 16
+    
+    # Eixos do gráfico
+    chart.x_axis.title = "Políticas de Backup Executadas"
+    chart.y_axis.title = f"Linha do Tempo (Dias Corridos a partir de {primeiro_start_dt.strftime('%d/%m %H:%M')})"
+    
+    # Referências do Excel (Dados das colunas C e D | Categorias da coluna A)
+    data_ref = Reference(ws, min_col=3, min_row=2, max_col=4, max_row=row_idx-1)
+    cats_ref = Reference(ws, min_col=1, min_row=3, max_row=row_idx-1)
+    
+    chart.add_data(data_ref, titles_from_data=True, from_rows=False)
+    chart.set_categories(cats_ref)
+    
+    # O truque de mágica do Gantt no Excel:
+    # A Série 1 (Ponto de Partida/Deslocamento) DEVE ficar invisível.
+    # A Série 2 (Duração Real) assume a cor de preenchimento de destaque da CPTM.
+    if len(chart.series) >= 2:
+        # Torna a barra de deslocamento invisível tirando as propriedades gráficas dela
+        chart.series[0].graphicalProperties.solidFill = None
+        chart.series[0].graphicalProperties.line.solidFill = None
+        
+        # Dá o destaque azul corporativo para a barra que representa a duração real do backup
+        chart.series[1].graphicalProperties.solidFill = C_HEADER_BG
+        chart.series[1].graphicalProperties.line.solidFill = C_HEADER_BG
+
+    # Esconde a legenda para o gráfico ficar limpo, já que o Gantt é autoexplicativo
+    chart.legend = None # type: ignore
+
+    # Posiciona o Gráfico de Gantt de forma imponente ao lado direito da tabela auxiliar
+    ws.add_chart(chart, "F2")
+
+# -------------------------------------------------------------------------------
+# Graficos das Janelas
+# -------------------------------------------------------------------------------
+
+def _sheet_graficos_janelas(wb, jobs):
+    """
+    Aba Nova — Agrupamento e Visão Gráfica de Tempo Total por Tipo de Política.
+    Gera 4 gráficos de barras horizontais replicando o modelo visual solicitado.
+    """
+    from openpyxl.chart import BarChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    
+    ws = wb.create_sheet("Janelas — Visão Gráfica")
+    ws.sheet_view.showGridLines = False
+    
+    # -------------------------------------------------------------------------
+    # 1. CLASSIFICAÇÃO E TRATAMENTO DA REGRA DE NEGÓCIO (PROCESSO DE DADOS)
+    # -------------------------------------------------------------------------
+    # Dicionários de agrupamento para reter o job mais longo { nome_politica: max_horas }
+    dados_categorias = {
+        "NetApp": {},
+        "Oracle": {},
+        "VMWares": {},
+        "Client Windows": {}
+    }
+
+    for j in jobs:
+        try:
+            job_dict = dict(j)
+        except:
+            job_dict = j
+            
+        policy_name = job_dict.get("job_policy")
+        elapsed_str = job_dict.get("elapsed_time")
+        
+        if not policy_name or not elapsed_str:
+            continue
+            
+        policy_upper = policy_name.upper()
+        horas = _iso_to_hours(elapsed_str) # Converte a duração ISO para float
+        
+        # Define a categoria baseado nos prefixos e regras da CPTM
+        if policy_upper.startswith("NETAPP_"):
+            cat = "NetApp"
+        elif policy_upper.startswith("ORACLE_"):
+            cat = "Oracle"
+        elif policy_upper.startswith("VMWARES_"):
+            cat = "VMWares"
+        else:
+            cat = "Client Windows"
+            
+        # Regra de Ouro (Aplica para todas, garantindo o teto/máximo para VMWares):
+        # Se a política já existir, mantém apenas o registro que levou mais tempo.
+        if policy_name not in dados_categorias[cat] or horas > dados_categorias[cat][policy_name]:
+            dados_categorias[cat][policy_name] = horas
+
+    # -------------------------------------------------------------------------
+    # 2. ESCRITA DAS MATRIZES DE SUPORTE NA PLANILHA (COLUNAS A até C)
+    # -------------------------------------------------------------------------
+    # Cabeçalho unificado para a tabela auxiliar de dados
+    _header_row(ws, 1, ["Categoria", "Política / Client", "Tempo Total (Horas)"], widths=[16, 25, 20])
+    
+    # Dicionário para guardar as coordenadas de início e fim de cada bloco para alimentar os gráficos
+    coordenadas_mapa = {}
+    row_atual = 2
+
+    for cat, pol_dict in dados_categorias.items():
+        if not pol_dict:
+            continue
+            
+        start_row = row_atual
+        # Ordena as políticas pelo nome de forma ascendente para manter o padrão sequencial (Ex: VMWares_1, 2, 3...)
+        for pol_name, horas in sorted(pol_dict.items()):
+            ws.cell(row=row_atual, column=1, value=cat)
+            ws.cell(row=row_atual, column=2, value=pol_name)
+            ws.cell(row=row_atual, column=3, value=round(horas, 2))
+            
+            # Formatação sutil da linha de dados
+            alt = (row_atual % 2 == 1)
+            for col in range(1, 4):
+                cell = ws.cell(row=row_atual, column=col)
+                cell.font = _font()
+                cell.fill = _fill(C_ALT_ROW if alt else C_WHITE)
+                cell.border = _border()
+                if col == 3:
+                    cell.alignment = _align("right")
+                    cell.number_format = '#,##0.00"h"'
+                else:
+                    cell.alignment = _align("left")
+            row_atual += 1
+            
+        end_row = row_atual - 1
+        coordenadas_mapa[cat] = (start_row, end_row)
+
+    # -------------------------------------------------------------------------
+    # 3. CONSTRUÇÃO E ALINHAMENTO DOS 4 GRÁFICOS (GRID VISUAL 2X2)
+    # -------------------------------------------------------------------------
+    # Mapa de posições das células onde os gráficos vão aterrissar na tela
+    posicoes_graficos = {
+        "NetApp": "E2",          # Superior Esquerdo
+        "Oracle": "N2",          # Superior Direito
+        "VMWares": "E20",        # Inferior Esquerdo
+        "Client Windows": "N20"  # Inferior Direito
+    }
+
+    for cat, local_celula in posicoes_graficos.items():
+        if cat not in coordenadas_mapa:
+            continue
+            
+        start_r, end_r = coordenadas_mapa[cat]
+        
+        # Instanciação do Gráfico de Barras Horizontais conforme modelo enviado
+        chart = BarChart()
+        chart.type = "bar"         # "bar" horizontal (se fosse vertical seria "col")
+        chart.style = 10           # Estilo nativo limpo
+        chart.title = f"Tempo Total de Backup - {cat}"
+        chart.width = 16
+        chart.height = 11
+        
+        # Referência dos Dados (Coluna C: Tempo Total em Horas)
+        data_ref = Reference(ws, min_col=3, min_row=start_r, max_row=end_r)
+        # Referência das Categorias/Eixo Y (Coluna B: Nome da Política)
+        cats_ref = Reference(ws, min_col=2, min_row=start_r, max_row=end_r)
+        
+        chart.add_data(data_ref, titles_from_data=False)
+        chart.set_categories(cats_ref)
+        
+        # Configurações do Título do Eixo X (Duração na horizontal)
+        chart.x_axis.title = "Duração (Horas)"
+        chart.y_axis.title = "Políticas"
+        
+        # Costumização das Cores das Barras para o Azul Padrão da CPTM (C_ACCENT)
+        if len(chart.series) > 0:
+            chart.series[0].graphicalProperties.solidFill = C_ACCENT
+            chart.series[0].graphicalProperties.line.solidFill = C_ACCENT
+            # Adiciona os rótulos numéricos de tempo em cima de cada barra para facilitar leitura imediata
+            chart.series[0].dataLabels = DataLabelList()
+            chart.series[0].dataLabels.showVal = True
+
+        # Remove a legenda lateral desnecessária (já que o título já diz a que se refere)
+        chart.legend = None # type: ignore
+        
+        # Renderiza o gráfico na posição correta do grid
+        ws.add_chart(chart, local_celula)
+
+    # Adiciona a importação necessária do DataLabelList localmente caso não mapeada no escopo global
+    import openpyxl.chart.label
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def generate_report(db_path=DB_PATH, output_dir=OUTPUT_DIR):
     print(f"Lendo banco: {db_path}")
-    avail, jobs, pols, tapes, volumes = _load(db_path)
+    avail, jobs, pols, tapes, volumes, tapes_history = _load(db_path)
 
     # Detecta mês de referência a partir dos jobs
     dates_in_jobs = [_parse_dt(j["start_time"]) for j in jobs if j["start_time"]]
@@ -930,6 +1697,10 @@ def generate_report(db_path=DB_PATH, output_dir=OUTPUT_DIR):
     _sheet_netapp_split(wb, jobs, pols, volumes)
     _sheet_netapp_volumes(wb, volumes)
     _sheet_fitas(wb, tapes)
+    _sheet_capacidade_fitas(wb, tapes, tapes_history, db_path)
+    _sheet_netapp_15_maiores(wb, volumes)
+    _sheet_gantt_jobs(wb, jobs)
+    _sheet_graficos_janelas(wb, jobs)
 
     # Salva com timestamp
     output_dir.mkdir(parents=True, exist_ok=True)

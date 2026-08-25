@@ -3,6 +3,9 @@
 py.env
 *.env
 
+#Backups de segurança
+*.bkp
+
 #Relatorios Prontos
 *.pdf
 *.docx
